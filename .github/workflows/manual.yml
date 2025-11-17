@@ -33,7 +33,7 @@ jobs:
 
       - name: Copy source to package folder
         run: |
-          cp main.py package/
+          cp lambda_function.py package/
           cp config.json package/
 
       - name: Zip Lambda package

@@ -41,7 +41,67 @@ jobs:
           cd package
           zip -r ../lambda.zip .
 
-      - name: Deploy to AWS Lambda
+      - name: Deploy to AWS Lambdaname: Build & Push Docker Image to ECR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPO: aws-cleanup-repo         # change if you want
+      IMAGE_TAG: latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::154292417400:role/Github-integration-role
+          role-session-name: github-actions-session
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR Repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names "${{ env.ECR_REPO }}" \
+          || aws ecr create-repository --repository-name "${{ env.ECR_REPO }}"
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+          | docker login --username AWS --password-stdin \
+            ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+        env:
+          ACCOUNT_ID: ${{ steps.auth-account.outputs.account_id }}
+
+      - name: Get AWS Account ID
+        id: auth-account
+        run: |
+          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t $ECR_REPO .
+
+      - name: Tag Docker image
+        run: |
+          docker tag $ECR_REPO:latest \
+            ${{ steps.auth-account.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:${{ env.IMAGE_TAG }}
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push \
+            ${{ steps.auth-account.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:${{ env.IMAGE_TAG }}
+
         run: |
           aws lambda update-function-code \
             --function-name aws-cleanup-lambda \

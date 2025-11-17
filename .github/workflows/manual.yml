@@ -1,47 +1,4 @@
-# This is a basic workflow that is manually triggered
-
-name: Manual workflow
-
-# Controls when the action will run. Workflow runs when manually triggered using the UI
-# or API.
-on:
-  workflow_dispatch:
-
-permissions:
-  id-token: write
-  contents: read
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials from OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::154292417400:role/Github-integration-role
-          role-session-name: "samplerolesession"
-          aws-region: us-east-1
-
-      - name: Install dependencies
-        run: |
-          python3 -m pip install --upgrade pip
-          pip3 install -r requirements.txt -t package/
-
-      - name: Copy source to package folder
-        run: |
-          cp lambda_function.py package/
-          cp config.json package/
-
-      - name: Zip Lambda package
-        run: |
-          cd package
-          zip -r ../lambda.zip .
-
-      - name: Deploy to AWS Lambdaname: Build & Push Docker Image to ECR
+name: Build & Push Docker Image to ECR
 
 on:
   workflow_dispatch:
@@ -101,8 +58,3 @@ jobs:
         run: |
           docker push \
             ${{ steps.auth-account.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:${{ env.IMAGE_TAG }}
-
-        run: |
-          aws lambda update-function-code \
-            --function-name aws-cleanup-lambda \
-            --zip-file fileb://lambda.zip

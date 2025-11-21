@@ -13,7 +13,7 @@ jobs:
 
     env:
       AWS_REGION: us-east-1
-      ECR_REPO: aws-cleanup-repo         # change if you want
+      ECR_REPO: aws-cleanup-repo
       IMAGE_TAG: latest
 
     steps:
@@ -27,6 +27,13 @@ jobs:
           role-session-name: github-actions-session
           aws-region: ${{ env.AWS_REGION }}
 
+      # Get Account ID *before* login
+      - name: Get AWS Account ID
+        id: auth
+        run: |
+          echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+          echo "Account ID: $ACCOUNT_ID"
+
       - name: Create ECR Repository if not exists
         run: |
           aws ecr describe-repositories --repository-names "${{ env.ECR_REPO }}" \
@@ -37,13 +44,6 @@ jobs:
           aws ecr get-login-password --region $AWS_REGION \
           | docker login --username AWS --password-stdin \
             ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-        env:
-          ACCOUNT_ID: ${{ steps.auth-account.outputs.account_id }}
-
-      - name: Get AWS Account ID
-        id: auth-account
-        run: |
-          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
         run: |
@@ -52,9 +52,9 @@ jobs:
       - name: Tag Docker image
         run: |
           docker tag $ECR_REPO:latest \
-            ${{ steps.auth-account.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:${{ env.IMAGE_TAG }}
+            ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$ECR_REPO:${IMAGE_TAG}
 
       - name: Push Docker image to ECR
         run: |
           docker push \
-            ${{ steps.auth-account.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:${{ env.IMAGE_TAG }}
+            ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$ECR_REPO:${IMAGE_TAG}

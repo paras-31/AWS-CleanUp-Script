@@ -1,4 +1,4 @@
-name: Build & Push Docker Image to ECR
+name: Build, Push to ECR & Deploy to ECS
 
 on:
   workflow_dispatch:
@@ -8,16 +8,19 @@ permissions:
   contents: read
 
 jobs:
-  build-and-push:
+  deploy:
     runs-on: ubuntu-latest
 
     env:
       AWS_REGION: us-east-1
       ECR_REPO: aws-cleanup-repo
       IMAGE_TAG: latest
+      ECS_CLUSTER: cleanup-cluster
+      ECS_SERVICE: cleanup-service
+      TASK_FAMILY: cleanup-task
 
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
@@ -27,17 +30,10 @@ jobs:
           role-session-name: github-actions-session
           aws-region: ${{ env.AWS_REGION }}
 
-      # Get Account ID *before* login
       - name: Get AWS Account ID
-        id: auth
+        id: aws-account
         run: |
           echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
-          echo "Account ID: $ACCOUNT_ID"
-
-      - name: Create ECR Repository if not exists
-        run: |
-          aws ecr describe-repositories --repository-names "${{ env.ECR_REPO }}" \
-          || aws ecr create-repository --repository-name "${{ env.ECR_REPO }}"
 
       - name: Login to Amazon ECR
         run: |
@@ -56,5 +52,47 @@ jobs:
 
       - name: Push Docker image to ECR
         run: |
-          docker push \
-            ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$ECR_REPO:${IMAGE_TAG}
+          docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$ECR_REPO:${IMAGE_TAG}
+
+      # ---------------------------
+      # ECS Deployment Steps
+      # ---------------------------
+
+      # - name: Download ECS Task Definition
+      #   run: |
+      #     aws ecs describe-task-definition \
+      #       --task-definition $TASK_FAMILY \
+      #       --query taskDefinition \
+      #       > task-definition.json
+
+      # - name: Update task definition with new image
+      #   id: taskdef
+      #   run: |
+      #     NEW_IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+      #     UPDATED=$(jq \
+      #       --arg IMAGE "$NEW_IMAGE" \
+      #       '.containerDefinitions[0].image = $IMAGE' task-definition.json)
+      #     echo "$UPDATED" > new-task-def.json
+
+      # - name: Register new Task Definition revision
+      #   id: register-task
+      #   run: |
+      #     REVISION=$(aws ecs register-task-definition \
+      #       --cli-input-json file://new-task-def.json \
+      #       --query 'taskDefinition.taskDefinitionArn' \
+      #       --output text)
+      #     echo "TASK_ARN=$REVISION" >> $GITHUB_ENV
+
+      # - name: Update ECS Service to new Task Definition
+      #   run: |
+      #     aws ecs update-service \
+      #       --cluster $ECS_CLUSTER \
+      #       --service $ECS_SERVICE \
+      #       --task-definition $TASK_ARN
+
+      # - name: Wait for ECS Deployment to Stabilize
+      #   run: |
+      #     aws ecs wait services-stable \
+      #       --cluster $ECS_CLUSTER \
+      #       --services $ECS_SERVICE
+

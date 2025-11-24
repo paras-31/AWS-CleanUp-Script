@@ -32,14 +32,13 @@ def now_ts():
 # Utility / S3 helpers
 # -------------------------
 def empty_and_delete_bucket(s3_client, bucket_name):
-    """Empty (including versions) then delete a bucket."""
     log.info(f"[S3] Emptying & deleting bucket: {bucket_name}")
 
     if SAFE_MODE:
         log.info("[S3] SAFE_MODE ON — would empty & delete bucket")
         return True
 
-    # Remove versions
+    # Delete object versions if enabled
     try:
         paginator = s3_client.get_paginator("list_object_versions")
         for page in paginator.paginate(Bucket=bucket_name):
@@ -50,9 +49,9 @@ def empty_and_delete_bucket(s3_client, bucket_name):
             if objs:
                 s3_client.delete_objects(Bucket=bucket_name, Delete={"Objects": objs})
     except ClientError:
-        pass  # versioning may not be enabled
+        pass
 
-    # Remove normal objects
+    # Delete normal objects
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket_name):
@@ -63,7 +62,7 @@ def empty_and_delete_bucket(s3_client, bucket_name):
         log.error(f"[S3] Error while emptying bucket {bucket_name}: {e}")
         return False
 
-    # Finally delete bucket
+    # Delete the bucket
     try:
         s3_client.delete_bucket(Bucket=bucket_name)
         log.info(f"[S3] Deleted bucket: {bucket_name}")
@@ -73,9 +72,6 @@ def empty_and_delete_bucket(s3_client, bucket_name):
         return False
 
 
-# -------------------------
-# S3 cleanup
-# -------------------------
 def cleanup_s3(region):
     s3 = boto3.client("s3", region_name=region)
     all_buckets = s3.list_buckets().get("Buckets", [])
@@ -83,24 +79,136 @@ def cleanup_s3(region):
     deleted = []
     for b in all_buckets:
         name = b["Name"]
+
         if name == BUCKET:
-            log.info(f"[S3] Skipping backup bucket: {name}")
             continue
 
         try:
             loc = s3.get_bucket_location(Bucket=name).get("LocationConstraint")
             bucket_region = loc if loc else "us-east-1"
-        except ClientError as e:
-            log.error(f"[S3] Could not get location for {name}: {e}")
+        except Exception:
             continue
 
         if bucket_region == region:
-            log.info(f"[S3] Found bucket in region {region}: {name}")
             if SAFE_MODE or empty_and_delete_bucket(s3, name):
                 deleted.append(name)
 
     return deleted
 
+
+# ===============================================================
+# EC2 Cleanup (Instances + Volumes + EIPs)
+# ===============================================================
+def cleanup_ec2(region):
+    ec2 = boto3.client("ec2", region_name=region)
+    deleted_instances = []
+    deleted_volumes = []
+    released_eips = []
+
+    log.info(f"[EC2] Starting EC2 cleanup in region {region}")
+
+    # -------- EC2 INSTANCES --------
+    try:
+        instances = ec2.describe_instances()
+        for reservation in instances["Reservations"]:
+            for inst in reservation["Instances"]:
+                inst_id = inst["InstanceId"]
+                state = inst["State"]["Name"]
+                log.info(f"[EC2] Found instance {inst_id} ({state})")
+
+                if SAFE_MODE:
+                    deleted_instances.append(inst_id)
+                    continue
+
+                if state not in ["terminated", "shutting-down"]:
+                    try:
+                        ec2.terminate_instances(InstanceIds=[inst_id])
+                        deleted_instances.append(inst_id)
+                        log.info(f"[EC2] Terminated instance: {inst_id}")
+                    except ClientError as e:
+                        log.error(f"[EC2] Failed to delete {inst_id}: {e}")
+
+    except Exception as e:
+        log.error(f"[EC2] Error listing instances: {e}")
+
+    # -------- UNATTACHED VOLUMES --------
+    try:
+        volumes = ec2.describe_volumes()
+        for vol in volumes["Volumes"]:
+            vol_id = vol["VolumeId"]
+            if len(vol["Attachments"]) == 0:
+                log.info(f"[EC2] Unattached volume found: {vol_id}")
+
+                if SAFE_MODE:
+                    deleted_volumes.append(vol_id)
+                    continue
+
+                try:
+                    ec2.delete_volume(VolumeId=vol_id)
+                    deleted_volumes.append(vol_id)
+                except ClientError as e:
+                    log.error(f"[EC2] Failed to delete volume {vol_id}: {e}")
+    except Exception as e:
+        log.error(f"[EC2] Error listing volumes: {e}")
+
+    # -------- UNASSOCIATED ELASTIC IPs --------
+    try:
+        eips = ec2.describe_addresses()
+        for eip in eips["Addresses"]:
+            if "AssociationId" not in eip:
+                alloc_id = eip["AllocationId"]
+                log.info(f"[EC2] Unused EIP: {alloc_id}")
+
+                if SAFE_MODE:
+                    released_eips.append(alloc_id)
+                    continue
+
+                try:
+                    ec2.release_address(AllocationId=alloc_id)
+                    released_eips.append(alloc_id)
+                except ClientError as e:
+                    log.error(f"[EC2] Failed to release EIP {alloc_id}: {e}")
+    except Exception as e:
+        log.error(f"[EC2] Error listing EIPs: {e}")
+
+    return {
+        "instances_deleted": deleted_instances,
+        "volumes_deleted": deleted_volumes,
+        "eips_released": released_eips
+    }
+
+
+# ===============================================================
+# Lambda Cleanup
+# ===============================================================
+def cleanup_lambda(region):
+    lam = boto3.client("lambda", region_name=region)
+    deleted_functions = []
+
+    log.info(f"[Lambda] Starting Lambda cleanup in region {region}")
+
+    try:
+        paginator = lam.get_paginator("list_functions")
+        for page in paginator.paginate():
+            for fn in page["Functions"]:
+                fn_name = fn["FunctionName"]
+                log.info(f"[Lambda] Found function: {fn_name}")
+
+                if SAFE_MODE:
+                    deleted_functions.append(fn_name)
+                    continue
+
+                try:
+                    lam.delete_function(FunctionName=fn_name)
+                    deleted_functions.append(fn_name)
+                    log.info(f"[Lambda] Deleted function: {fn_name}")
+                except ClientError as e:
+                    log.error(f"[Lambda] Failed to delete {fn_name}: {e}")
+
+    except Exception as e:
+        log.error(f"[Lambda] Error listing Lambda functions: {e}")
+
+    return deleted_functions
 
 # -------------------------
 # ELB cleanup
@@ -298,35 +406,28 @@ def cleanup_vpcs(region):
 # -------------------------
 def run_cleanup():
     results = {}
-    timestamp = now_ts()
-
     for region in config["regions"]:
         log.info(f"\n===== REGION: {region} =====")
 
-        region_res = {
+        results[region] = {
             "s3_deleted": cleanup_s3(region),
+            "ec2_deleted": cleanup_ec2(region),
+            "lambda_deleted": cleanup_lambda(region),
             "elb_deleted": cleanup_elb(region),
             "elbv2_deleted": cleanup_elbv2(region)[0],
             "target_groups_deleted": cleanup_elbv2(region)[1],
             "asg_deleted": cleanup_asg(region),
             "rds_deleted": cleanup_rds(region),
-            "vpcs_deleted": cleanup_vpcs(region)
+            "vpcs_deleted": cleanup_vpcs(region),
         }
-
-        results[region] = region_res
-
     return results
 
 
-# -------------------------
-# ENTRYPOINT for ECS
-# -------------------------
 def main():
     log.info("Starting cleanup job...")
-    out = run_cleanup()
+    output = run_cleanup()
     log.info("Cleanup completed.")
-    log.info(json.dumps(out, indent=4))
-
+    log.info(json.dumps(output, indent=4))
 
 if __name__ == "__main__":
     main()

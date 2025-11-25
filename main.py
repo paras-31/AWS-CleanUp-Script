@@ -401,6 +401,150 @@ def cleanup_vpcs(region):
     return deleted
 
 
+# ===============================================================
+# EKS Cleanup (Cluster, Nodegroups, Fargate Profiles)
+# ===============================================================
+def cleanup_eks(region):
+    eks = boto3.client("eks", region_name=region)
+    deleted_clusters = []
+    deleted_nodegroups = []
+    deleted_fargate = []
+
+    log.info(f"[EKS] Starting EKS cleanup in region {region}")
+
+    try:
+        clusters = eks.list_clusters().get("clusters", [])
+    except Exception as e:
+        log.error(f"[EKS] Error listing clusters: {e}")
+        return {
+            "clusters_deleted": deleted_clusters,
+            "nodegroups_deleted": deleted_nodegroups,
+            "fargate_deleted": deleted_fargate
+        }
+
+    for cluster in clusters:
+        log.info(f"[EKS] Found cluster: {cluster}")
+
+        # ------------------------------------
+        # 1) Delete Nodegroups
+        # ------------------------------------
+        try:
+            nodegroups = eks.list_nodegroups(clusterName=cluster).get("nodegroups", [])
+            for ng in nodegroups:
+                log.info(f"[EKS] Deleting nodegroup: {ng}")
+
+                if SAFE_MODE:
+                    deleted_nodegroups.append(ng)
+                    continue
+
+                try:
+                    eks.delete_nodegroup(clusterName=cluster, nodegroupName=ng)
+                    deleted_nodegroups.append(ng)
+                except Exception as e:
+                    log.error(f"[EKS] Failed to delete nodegroup {ng}: {e}")
+
+        except Exception:
+            pass
+
+        # ------------------------------------
+        # 2) Delete Fargate Profiles
+        # ------------------------------------
+        try:
+            fargate_profiles = eks.list_fargate_profiles(clusterName=cluster).get("fargateProfileNames", [])
+            for fp in fargate_profiles:
+                log.info(f"[EKS] Deleting Fargate profile: {fp}")
+
+                if SAFE_MODE:
+                    deleted_fargate.append(fp)
+                    continue
+
+                try:
+                    eks.delete_fargate_profile(clusterName=cluster, fargateProfileName=fp)
+                    deleted_fargate.append(fp)
+                except Exception as e:
+                    log.error(f"[EKS] Failed to delete Fargate profile {fp}: {e}")
+
+        except Exception:
+            pass
+
+        # ------------------------------------
+        # 3) Delete Main EKS Cluster
+        # ------------------------------------
+        if SAFE_MODE:
+            deleted_clusters.append(cluster)
+            continue
+
+        try:
+            log.info(f"[EKS] Deleting EKS cluster: {cluster}")
+            eks.delete_cluster(name=cluster)
+            deleted_clusters.append(cluster)
+        except Exception as e:
+            log.error(f"[EKS] Failed to delete cluster {cluster}: {e}")
+
+    return {
+        "clusters_deleted": deleted_clusters,
+        "nodegroups_deleted": deleted_nodegroups,
+        "fargate_deleted": deleted_fargate
+    }
+
+# ===============================================================
+# CloudFormation Cleanup (EKS ONLY)
+# ===============================================================
+def cleanup_cloudformation_eks_only(region):
+    cfn = boto3.client("cloudformation", region_name=region)
+    deleted = []
+
+    log.info(f"[CFN] Starting EKS-only CloudFormation cleanup in region {region}")
+
+    try:
+        stacks = cfn.describe_stacks().get("Stacks", [])
+    except ClientError as e:
+        log.error(f"[CFN] Error listing stacks: {e}")
+        return deleted
+
+    # Filter ONLY EKS-related stacks
+    eks_stacks = []
+
+    for st in stacks:
+        name = st["StackName"]
+        status = st["StackStatus"]
+
+        # Ignore already deleted or failed stacks
+        if status.endswith("FAILED") or "DELETE" in status:
+            continue
+
+        # Match patterns of EKS stacks
+        if (
+            "EKS" in name.upper()
+            or "NODEGROUP" in name.upper()
+            or "FARGATE" in name.upper()
+            or "EKSCLUSTER" in name.upper()
+        ):
+            eks_stacks.append(name)
+
+    # Delete ONLY EKS stacks
+    for name in eks_stacks:
+        log.info(f"[CFN] Found EKS stack: {name}")
+
+        if SAFE_MODE:
+            deleted.append(name)
+            continue
+
+        try:
+            cfn.delete_stack(StackName=name)
+            log.info(f"[CFN] Deleting EKS stack: {name}")
+
+            waiter = cfn.get_waiter("stack_delete_complete")
+            waiter.wait(StackName=name)
+            deleted.append(name)
+            log.info(f"[CFN] Deleted EKS stack: {name}")
+
+        except ClientError as e:
+            log.error(f"[CFN] Failed to delete {name}: {e}")
+
+    return deleted
+
+
 # -------------------------
 # MAIN EXECUTION
 # -------------------------
@@ -411,13 +555,18 @@ def run_cleanup():
 
         results[region] = {
             "s3_deleted": cleanup_s3(region),
-            "ec2_deleted": cleanup_ec2(region),
             "lambda_deleted": cleanup_lambda(region),
             "elb_deleted": cleanup_elb(region),
             "elbv2_deleted": cleanup_elbv2(region)[0],
             "target_groups_deleted": cleanup_elbv2(region)[1],
             "asg_deleted": cleanup_asg(region),
             "rds_deleted": cleanup_rds(region),
+             # 🟦 NEW — Full EKS Cleanup
+            "eks_deleted": cleanup_eks(region),
+
+            # 🟦 Delete ONLY EKS CloudFormation stacks
+            "cloudformation_eks_deleted": cleanup_cloudformation_eks_only(region),
+            "ec2_deleted": cleanup_ec2(region),
             "vpcs_deleted": cleanup_vpcs(region),
         }
     return results
